@@ -1,0 +1,662 @@
+/*Door Access*/
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+#include "esp_attr.h"
+#include "esp_err.h"
+
+#include "RFID.h"
+#include "OLED.h"
+
+
+#define GREEN_LED   GPIO_NUM_25
+#define RED_LED     GPIO_NUM_26
+#define BLUE_LED    GPIO_NUM_27
+#define BUZZER      GPIO_NUM_33
+#define BUTTON      GPIO_NUM_32
+#define DOOR_PIN    GPIO_NUM_14
+
+
+typedef struct
+{
+    char uid[12];
+} CardData;
+
+
+QueueHandle_t xCardQueue;
+SemaphoreHandle_t xOledMutex;
+SemaphoreHandle_t xExitSem;
+
+int okCount = 0;
+int noCount = 0;
+
+
+// Button Interrupt
+void IRAM_ATTR ExitButtonISR(void *arg)
+{
+    BaseType_t taskWoken = pdFALSE;
+
+    xSemaphoreGiveFromISR(xExitSem, &taskWoken);
+
+    if (taskWoken == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
+}
+
+
+// Open Door
+void OpenDoor(void)
+{
+    gpio_set_level(DOOR_PIN, 1);
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    gpio_set_level(DOOR_PIN, 0);
+}
+
+
+// Task 1: Scan RFID
+void ScanTask(void *pvParameters)
+{
+    CardData card;
+    TickType_t lastWakeTime = xTaskGetTickCount();
+
+    while (1)
+    {
+        if (RFID_ReadCard(card.uid)==1)
+        {
+            xQueueSend(xCardQueue, &card, portMAX_DELAY);
+        }
+
+        vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(100));
+    }
+}
+
+
+// Task 2: Check Access
+void AccessTask(void *pvParameters)
+{
+    CardData card;
+
+    while (1)
+    {
+        if (xQueueReceive(xCardQueue, &card, portMAX_DELAY) == pdTRUE)
+        {
+            const char *name = CheckCard(card.uid);
+
+            if (name != NULL)
+            {
+                xSemaphoreTake(xOledMutex, portMAX_DELAY);
+
+                okCount++;
+                OLED_ShowAccess("ACCESS GRANTED", name);
+
+                xSemaphoreGive(xOledMutex);
+
+                gpio_set_level(GREEN_LED, 1);
+                gpio_set_level(BLUE_LED, 1);
+                gpio_set_level(RED_LED, 0);
+
+                gpio_set_level(BUZZER, 1);
+                vTaskDelay(pdMS_TO_TICKS(150));
+                gpio_set_level(BUZZER, 0);
+
+                OpenDoor();
+
+                gpio_set_level(GREEN_LED, 0);
+                gpio_set_level(BLUE_LED, 0);
+            }
+            else
+            {
+                xSemaphoreTake(xOledMutex, portMAX_DELAY);
+
+                noCount++;
+                OLED_ShowAccess("ACCESS DENIED", "UNKNOWN");
+
+                xSemaphoreGive(xOledMutex);
+
+                gpio_set_level(GREEN_LED, 0);
+                gpio_set_level(BLUE_LED, 0);
+                gpio_set_level(RED_LED, 1);
+
+                for (int i = 0; i < 3; i++)
+                {
+                    gpio_set_level(BUZZER, 1);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+
+                    gpio_set_level(BUZZER, 0);
+                    vTaskDelay(pdMS_TO_TICKS(250));
+                }
+
+                gpio_set_level(RED_LED, 0);
+            }
+        }
+    }
+}
+
+
+// Task 3: Display Counts
+void DisplayTask(void *pvParameters)
+{
+    while (1)
+    {
+        xSemaphoreTake(xOledMutex, portMAX_DELAY);
+
+        OLED_ShowCounts(okCount, noCount);
+
+        xSemaphoreGive(xOledMutex);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
+// Task 4: Exit Button
+void ExitTask(void *pvParameters)
+{
+    while (1)
+    {
+        xSemaphoreTake(xExitSem, portMAX_DELAY);
+
+        OpenDoor();
+    }
+}
+
+
+// Main
+void app_main(void)
+{
+    RFID_Init();
+    OLED_Init();
+
+    xCardQueue = xQueueCreate(4, sizeof(CardData));
+    xOledMutex = xSemaphoreCreateMutex();
+    xExitSem = xSemaphoreCreateBinary();
+
+    if (xCardQueue == NULL || xOledMutex == NULL || xExitSem == NULL)
+    {
+        return;
+    }
+
+    gpio_set_direction(GREEN_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(RED_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BLUE_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
+    gpio_set_direction(DOOR_PIN, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(GREEN_LED, 0);
+    gpio_set_level(RED_LED, 0);
+    gpio_set_level(BLUE_LED, 0);
+    gpio_set_level(BUZZER, 0);
+    gpio_set_level(DOOR_PIN, 0);
+
+
+    gpio_set_direction(BUTTON, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON, GPIO_PULLUP_ONLY);
+    gpio_set_intr_type(BUTTON, GPIO_INTR_NEGEDGE);
+
+
+    if (gpio_install_isr_service(0) != ESP_OK)
+    {
+        return;
+    }
+
+    if (gpio_isr_handler_add(BUTTON, ExitButtonISR, NULL) != ESP_OK)
+    {
+        return;
+    }
+
+    xTaskCreate(ScanTask, "ScanTask", 4096, NULL, 2, NULL);
+    xTaskCreate(AccessTask, "AccessTask", 4096, NULL, 3, NULL);
+    xTaskCreate(DisplayTask, "DisplayTask", 4096, NULL, 1, NULL);
+    xTaskCreate(ExitTask, "ExitTask", 4096, NULL, 4, NULL);
+}
+
+
+/*SmartParking*/
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* 1. Pins */
+
+#define GREEN_LED   GPIO_NUM_25
+#define RED_LED     GPIO_NUM_26
+#define BUZZER      GPIO_NUM_27
+
+/* 2. Constants */
+
+#define MAX_SPACES  3
+#define MAX_CARDS   8
+
+/* 3. Card Data */
+
+typedef struct
+{
+    uint32_t id;
+    bool inside;
+} Card_t;
+
+/* 4. Display Data */
+
+typedef struct
+{
+    int freeSpaces;
+    int message;
+} Display_t;
+
+/* 5. Feedback Data */
+
+typedef struct
+{
+    int event;
+    int freeSpaces;
+} Feedback_t;
+
+/* 6. Messages */
+
+#define WELCOME       1
+#define GOODBYE       2
+#define PARKING_FULL  3
+
+#define ENTRY         1
+#define EXIT          2
+#define FULL          3
+
+/* 7. Global Variables */
+
+Card_t cards[MAX_CARDS];
+
+int cardCount = 0;
+
+/* 8. RTOS Objects */
+
+QueueHandle_t RFID_Queue;
+QueueHandle_t Display_Queue;
+QueueHandle_t Feedback_Queue;
+
+SemaphoreHandle_t xSlots;
+SemaphoreHandle_t xCardMutex;
+
+/* 9. Drivers */
+
+bool RFID_ReadCard(uint32_t *id);
+
+void OLED_Show(int freeSpaces, int message);
+
+
+/* 10. RFID Task */
+
+void RFID_Task(void *pv)
+{
+    uint32_t cardID;
+
+    while (1)
+    {
+        if (RFID_ReadCard(&cardID))
+        {
+            xQueueSend(RFID_Queue, &cardID, portMAX_DELAY);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+
+/* 11. Parking Logic Task */
+
+void Parking_Logic_Task(void *pv)
+{
+    uint32_t cardID;
+
+    Display_t display;
+    Feedback_t feedback;
+
+    while (1)
+    {
+        if (xQueueReceive(RFID_Queue, &cardID, portMAX_DELAY))
+        {
+            xSemaphoreTake(xCardMutex, portMAX_DELAY);
+
+            int index = -1;
+
+            /* Search Card */
+
+            for (int i = 0; i < cardCount; i++)
+            {
+                if (cards[i].id == cardID)
+                {
+                    index = i;
+                    break;
+                }
+            }
+
+            /* Register New Card */
+
+            if (index == -1 && cardCount < MAX_CARDS)
+            {
+                index = cardCount;
+
+                cards[index].id = cardID;
+                cards[index].inside = false;
+
+                cardCount++;
+            }
+
+            /* Card List Full */
+
+            if (index == -1)
+            {
+                feedback.event = FULL;
+                display.message = PARKING_FULL;
+            }
+
+            /* Exit */
+
+            else if (cards[index].inside == true)
+            {
+                cards[index].inside = false;
+
+                xSemaphoreGive(xSlots);
+
+                feedback.event = EXIT;
+                display.message = GOODBYE;
+            }
+
+            /* Entry */
+
+            else
+            {
+                if (xSemaphoreTake(xSlots, 0) == pdTRUE)
+                {
+                    cards[index].inside = true;
+
+                    feedback.event = ENTRY;
+                    display.message = WELCOME;
+                }
+                else
+                {
+                    feedback.event = FULL;
+                    display.message = PARKING_FULL;
+                }
+            }
+
+            xSemaphoreGive(xCardMutex);
+
+            /* Update Free Spaces */
+
+            display.freeSpaces = uxSemaphoreGetCount(xSlots);
+
+            feedback.freeSpaces = display.freeSpaces;
+
+            /* Send Data */
+
+            xQueueSend(Display_Queue, &display, portMAX_DELAY);
+
+            xQueueSend(Feedback_Queue, &feedback, portMAX_DELAY);
+        }
+    }
+}
+
+
+/* 12. Display Task */
+
+void Display_Task(void *pv)
+{
+    Display_t data;
+
+    while (1)
+    {
+        if (xQueueReceive(Display_Queue, &data, portMAX_DELAY))
+        {
+            OLED_Show(data.freeSpaces, data.message);
+        }
+    }
+}
+
+
+/* 13. Feedback Task */
+
+void Feedback_Task(void *pv)
+{
+    Feedback_t data;
+
+    while (1)
+    {
+        if (xQueueReceive(Feedback_Queue, &data, portMAX_DELAY))
+        {
+            /* LED Status */
+
+            if (data.freeSpaces > 0)
+            {
+                gpio_set_level(GREEN_LED, 1);
+                gpio_set_level(RED_LED, 0);
+            }
+            else
+            {
+                gpio_set_level(GREEN_LED, 0);
+                gpio_set_level(RED_LED, 1);
+            }
+
+            /* Entry or Exit */
+
+            if (data.event == ENTRY || data.event == EXIT)
+            {
+                gpio_set_level(BUZZER, 1);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                gpio_set_level(BUZZER, 0);
+            }
+
+            /* Parking Full */
+
+            else if (data.event == FULL)
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    gpio_set_level(BUZZER, 1);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+
+                    gpio_set_level(BUZZER, 0);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
+            }
+        }
+    }
+}
+
+
+/* 14. Main */
+
+void app_main(void)
+{
+    /* GPIO Direction */
+
+    gpio_set_direction(GREEN_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(RED_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
+
+    /* Create Queues */
+
+    RFID_Queue = xQueueCreate(5, sizeof(uint32_t));
+
+    Display_Queue = xQueueCreate(5, sizeof(Display_t));
+
+    Feedback_Queue = xQueueCreate(5, sizeof(Feedback_t));
+
+    /* Create Semaphores */
+
+    xSlots = xSemaphoreCreateCounting(MAX_SPACES, MAX_SPACES);
+
+    xCardMutex = xSemaphoreCreateMutex();
+
+    /* Create Tasks */
+
+    xTaskCreate(RFID_Task, "RFID", 2048, NULL, 2, NULL);
+
+    xTaskCreate(Parking_Logic_Task, "Parking", 4096, NULL, 3, NULL);
+
+    xTaskCreate(Display_Task, "Display", 2048, NULL, 1, NULL);
+
+    xTaskCreate(Feedback_Task, "Feedback", 2048, NULL, 1, NULL);
+}
+
+
+/*Nurse*/
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+#include "esp_timer.h"
+
+#include <stdio.h>
+
+#define RED_LED GPIO_NUM_25
+#define BUZZER  GPIO_NUM_26
+
+#define NURSE_PRIORITY    3
+#define TELEMETRY_PRIORITY 2
+#define LOGGER_PRIORITY   1
+
+#define PARTS 8
+#define PART_TIME 75
+
+SemaphoreHandle_t xOLEDMutex;
+
+int64_t requestTime;
+int64_t acquireTime;
+
+void OLED_ShowNurseCall(void)
+{
+    printf("NURSE CALL\n");
+}
+
+void OLED_DrawHistoryPart(int part)
+{
+    printf("History Part: %d\n", part);
+}
+
+void Telemetry_Process(void)
+{
+    printf("Telemetry Processing\n");
+}
+
+
+/* NurseCall Task */
+
+void NurseCall_Task(void *pv)
+{
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        requestTime = esp_timer_get_time();
+
+        xSemaphoreTake(xOLEDMutex, portMAX_DELAY);
+
+        acquireTime = esp_timer_get_time();
+
+        printf("OLED Wait = %lld us\n",
+               acquireTime - requestTime);
+
+        OLED_ShowNurseCall();
+
+        gpio_set_level(RED_LED, 1);
+
+        gpio_set_level(BUZZER, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(BUZZER, 0);
+
+        xSemaphoreGive(xOLEDMutex);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
+/* Telemetry Task */
+
+void Telemetry_Task(void *pv)
+{
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        Telemetry_Process();
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+
+/* Logger Task */
+
+void Logger_Task(void *pv)
+{
+    while (1)
+    {
+        for (int i = 0; i < PARTS; i++)
+        {
+            xSemaphoreTake(xOLEDMutex, portMAX_DELAY);
+
+            OLED_DrawHistoryPart(i);
+
+            vTaskDelay(pdMS_TO_TICKS(PART_TIME));
+
+            xSemaphoreGive(xOLEDMutex);
+
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+
+/* Main */
+
+void app_main(void)
+{
+    gpio_set_direction(RED_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
+
+    xOLEDMutex = xSemaphoreCreateMutex();
+
+    xTaskCreate(
+        NurseCall_Task,
+        "NurseCall",
+        2048,
+        NULL,
+        NURSE_PRIORITY,
+        NULL
+    );
+
+    xTaskCreate(
+        Telemetry_Task,
+        "Telemetry",
+        2048,
+        NULL,
+        TELEMETRY_PRIORITY,
+        NULL
+    );
+
+    xTaskCreate(
+        Logger_Task,
+        "Logger",
+        2048,
+        NULL,
+        LOGGER_PRIORITY,
+        NULL
+    );
+}
