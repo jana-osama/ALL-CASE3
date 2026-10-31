@@ -660,3 +660,243 @@ void app_main(void)
         NULL
     );
 }
+
+
+/*Smart Access and Room */
+#include <stdio.h>
+#include <stdint.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+
+#include "RFID.h"
+#include "RTC.h"
+#include "OLED.h"
+
+#define RELAY1 GPIO_NUM_18
+#define RELAY2 GPIO_NUM_19
+#define STATUS_LED GPIO_NUM_2
+
+#define RELAY_TIME 10000
+
+typedef struct
+{
+    uint32_t cardID;
+    int allowed;
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+} AccessData;
+
+typedef struct
+{
+    int allowed;
+} DisplayData;
+
+QueueHandle_t RFID_Queue;
+QueueHandle_t Relay_Queue;
+QueueHandle_t Display_Queue;
+QueueHandle_t Log_Queue;
+
+SemaphoreHandle_t I2C_Mutex;
+
+
+int CheckCard(uint32_t cardID)
+{
+    if (cardID == 1234 || cardID == 5678 || cardID == 9012)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+void RFID_Task(void *pvParameters)
+{
+    uint32_t cardID;
+
+    while (1)
+    {
+        if (RFID_ReadCard(&cardID))
+        {
+            xQueueSend(RFID_Queue, &cardID, portMAX_DELAY);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+
+void Access_Task(void *pvParameters)
+{
+    uint32_t cardID;
+    AccessData data;
+    DisplayData display;
+
+    while (1)
+    {
+        if (xQueueReceive(RFID_Queue, &cardID, portMAX_DELAY))
+        {
+            data.cardID = cardID;
+            data.allowed = CheckCard(cardID);
+
+            if (data.allowed == 1)
+            {
+                xQueueSend(Relay_Queue, &data.allowed, 0);
+            }
+
+            xSemaphoreTake(I2C_Mutex, portMAX_DELAY);
+
+            RTC_ReadDateTime(&data);
+
+            xSemaphoreGive(I2C_Mutex);
+
+            display.allowed = data.allowed;
+
+            xQueueSend(Display_Queue, &display, 0);
+            xQueueSend(Log_Queue, &data, 0);
+        }
+    }
+}
+
+
+void Relay_Task(void *pvParameters)
+{
+    int event;
+    TickType_t endTime = 0;
+
+    gpio_set_level(RELAY1, 0);
+    gpio_set_level(RELAY2, 0);
+
+    while (1)
+    {
+        if (xQueueReceive(Relay_Queue, &event, pdMS_TO_TICKS(10)))
+        {
+            gpio_set_level(RELAY1, 1);
+            gpio_set_level(RELAY2, 1);
+
+            endTime = xTaskGetTickCount() +
+                      pdMS_TO_TICKS(RELAY_TIME);
+        }
+
+        if (endTime != 0)
+        {
+            if ((int32_t)(endTime - xTaskGetTickCount()) <= 0)
+            {
+                gpio_set_level(RELAY1, 0);
+                gpio_set_level(RELAY2, 0);
+
+                endTime = 0;
+            }
+        }
+    }
+}
+
+
+void Display_Task(void *pvParameters)
+{
+    DisplayData data;
+
+    while (1)
+    {
+        if (xQueueReceive(Display_Queue, &data, portMAX_DELAY))
+        {
+            xSemaphoreTake(I2C_Mutex, portMAX_DELAY);
+
+            if (data.allowed == 1)
+            {
+                OLED_ShowAccess("ACCESS GRANTED");
+            }
+            else
+            {
+                OLED_ShowAccess("ACCESS DENIED");
+            }
+
+            xSemaphoreGive(I2C_Mutex);
+        }
+    }
+}
+
+
+void Clock_Task(void *pvParameters)
+{
+    AccessData timeData;
+
+    while (1)
+    {
+        xSemaphoreTake(I2C_Mutex, portMAX_DELAY);
+
+        RTC_ReadDateTime(&timeData);
+        OLED_ShowClock(&timeData);
+
+        xSemaphoreGive(I2C_Mutex);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
+void Logger_Task(void *pvParameters)
+{
+    AccessData data;
+
+    while (1)
+    {
+        if (xQueueReceive(Log_Queue, &data, portMAX_DELAY))
+        {
+            printf("Card ID: %lu\n", (unsigned long)data.cardID);
+
+            if (data.allowed == 1)
+            {
+                printf("Decision: ACCESS GRANTED\n");
+            }
+            else
+            {
+                printf("Decision: ACCESS DENIED\n");
+            }
+
+            printf("Date: %d/%d/%d\n",
+                   data.day, data.month, data.year);
+
+            printf("Time: %d:%d:%d\n",
+                   data.hour, data.minute, data.second);
+        }
+    }
+}
+
+
+void app_main(void)
+{
+    gpio_set_direction(RELAY1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(RELAY2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(STATUS_LED, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(STATUS_LED, 1);
+
+    RFID_Queue = xQueueCreate(5, sizeof(uint32_t));
+    Relay_Queue = xQueueCreate(5, sizeof(int));
+    Display_Queue = xQueueCreate(5, sizeof(DisplayData));
+    Log_Queue = xQueueCreate(10, sizeof(AccessData));
+
+    I2C_Mutex = xSemaphoreCreateMutex();
+
+    xTaskCreate(RFID_Task, "RFID", 2048, NULL, 3, NULL);
+
+    xTaskCreate(Access_Task, "Access", 2048, NULL, 4, NULL);
+
+    xTaskCreate(Relay_Task, "Relay", 2048, NULL, 2, NULL);
+
+    xTaskCreate(Display_Task, "Display", 2048, NULL, 1, NULL);
+
+    xTaskCreate(Clock_Task, "Clock", 2048, NULL, 1, NULL);
+
+    xTaskCreate(Logger_Task, "Logger", 2048, NULL, 1, NULL);
+}
