@@ -900,3 +900,288 @@ void app_main(void)
 
     xTaskCreate(Logger_Task, "Logger", 2048, NULL, 1, NULL);
 }
+
+
+
+/*Vaccina Fridge*/
+
+#include <stdio.h>
+#include <stdint.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+
+#include "Sensor.h"
+#include "OLED.h"
+
+
+#define GREEN_LED GPIO_NUM_25
+#define RED_LED   GPIO_NUM_26
+#define BUZZER    GPIO_NUM_27
+#define DOOR_PIN  GPIO_NUM_32
+
+
+typedef struct
+{
+    float temperature;
+} TempData;
+
+
+typedef struct
+{
+    int type;
+    int state;
+} AlarmData;
+
+
+typedef struct
+{
+    float min;
+    float max;
+    float average;
+} SummaryData;
+
+
+#define DOOR_EVENT  1
+#define TEMP_EVENT  2
+
+
+QueueHandle_t Temp_Queue;
+QueueHandle_t Alarm_Queue;
+QueueHandle_t Summary_Queue;
+
+SemaphoreHandle_t Door_Semaphore;
+SemaphoreHandle_t OLED_Mutex;
+
+
+void Door_ISR(void *arg)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xSemaphoreGiveFromISR(
+        Door_Semaphore,
+        &xHigherPriorityTaskWoken
+    );
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+
+void Temp_Task(void *pvParameters)
+{
+    TempData data;
+
+    TickType_t lastWakeTime = xTaskGetTickCount();
+
+    while (1)
+    {
+        data.temperature = Temp_ReadC();
+
+        xQueueSend(Temp_Queue, &data, 0);
+
+        vTaskDelayUntil(
+            &lastWakeTime,
+            pdMS_TO_TICKS(200)
+        );
+    }
+}
+
+
+void Door_Task(void *pvParameters)
+{
+    AlarmData event;
+
+    while (1)
+    {
+        xSemaphoreTake(Door_Semaphore, portMAX_DELAY);
+
+        if (gpio_get_level(DOOR_PIN) == 1)
+        {
+            event.type = DOOR_EVENT;
+            event.state = 1;
+
+            printf("DOOR OPEN\n");
+
+            xQueueSend(Alarm_Queue, &event, portMAX_DELAY);
+        }
+    }
+}
+
+
+void Check_Task(void *pvParameters)
+{
+    TempData data;
+    AlarmData alarm;
+
+    float min = 1000;
+    float max = -1000;
+    float sum = 0;
+    int count = 0;
+
+    int lastHigh = -1;
+
+    SummaryData summary;
+
+    while (1)
+    {
+        if (xQueueReceive(Temp_Queue, &data, portMAX_DELAY))
+        {
+            float temp = data.temperature;
+
+            if (temp < min)
+            {
+                min = temp;
+            }
+
+            if (temp > max)
+            {
+                max = temp;
+            }
+
+            sum += temp;
+            count++;
+
+            summary.min = min;
+            summary.max = max;
+            summary.average = sum / count;
+
+            xQueueOverwrite(Summary_Queue, &summary);
+
+            if (temp > 8 && lastHigh != 1)
+            {
+                alarm.type = TEMP_EVENT;
+                alarm.state = 1;
+
+                xQueueSend(Alarm_Queue, &alarm, 0);
+
+                lastHigh = 1;
+            }
+            else if (temp <= 8 && lastHigh != 0)
+            {
+                alarm.type = TEMP_EVENT;
+                alarm.state = 0;
+
+                xQueueSend(Alarm_Queue, &alarm, 0);
+
+                lastHigh = 0;
+            }
+        }
+    }
+}
+
+
+void Alarm_Task(void *pvParameters)
+{
+    AlarmData event;
+
+    while (1)
+    {
+        if (xQueueReceive(Alarm_Queue, &event, portMAX_DELAY))
+        {
+            xSemaphoreTake(OLED_Mutex, portMAX_DELAY);
+
+            if (event.type == DOOR_EVENT)
+            {
+                OLED_ShowMessage("DOOR OPEN");
+            }
+
+            else if (event.type == TEMP_EVENT)
+            {
+                if (event.state == 1)
+                {
+                    gpio_set_level(RED_LED, 1);
+                    gpio_set_level(GREEN_LED, 0);
+                    gpio_set_level(BUZZER, 1);
+
+                    OLED_ShowMessage("TEMP HIGH");
+                }
+                else
+                {
+                    gpio_set_level(RED_LED, 0);
+                    gpio_set_level(GREEN_LED, 1);
+                    gpio_set_level(BUZZER, 0);
+
+                    OLED_ShowMessage("TEMP NORMAL");
+                }
+            }
+
+            xSemaphoreGive(OLED_Mutex);
+        }
+    }
+}
+
+
+void Display_Task(void *pvParameters)
+{
+    SummaryData summary;
+
+    TickType_t lastWakeTime = xTaskGetTickCount();
+
+    while (1)
+    {
+        vTaskDelayUntil(
+            &lastWakeTime,
+            pdMS_TO_TICKS(2000)
+        );
+
+        if (xQueuePeek(Summary_Queue, &summary, 0) == pdPASS)
+        {
+            printf("Minimum: %.2f\n", summary.min);
+            printf("Maximum: %.2f\n", summary.max);
+            printf("Average: %.2f\n", summary.average);
+
+            for (int i = 0; i < 8; i++)
+            {
+                xSemaphoreTake(OLED_Mutex, portMAX_DELAY);
+
+                OLED_DrawHistoryPart(i, summary.min,
+                                     summary.max, summary.average);
+
+                xSemaphoreGive(OLED_Mutex);
+            }
+        }
+    }
+}
+
+
+void app_main(void)
+{
+    gpio_set_direction(GREEN_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(RED_LED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
+
+    gpio_set_direction(DOOR_PIN, GPIO_MODE_INPUT);
+
+    gpio_set_pull_mode(DOOR_PIN, GPIO_PULLDOWN_ONLY);
+
+    gpio_set_intr_type(DOOR_PIN, GPIO_INTR_POSEDGE);
+
+    Temp_Queue = xQueueCreate(5, sizeof(TempData));
+
+    Alarm_Queue = xQueueCreate(10, sizeof(AlarmData));
+
+    Summary_Queue = xQueueCreate(1, sizeof(SummaryData));
+
+    Door_Semaphore = xSemaphoreCreateBinary();
+
+    OLED_Mutex = xSemaphoreCreateMutex();
+
+    gpio_install_isr_service(0);
+
+    gpio_isr_handler_add(DOOR_PIN, Door_ISR, NULL);
+
+
+    xTaskCreate(Temp_Task, "Temp", 2048, NULL, 3, NULL);
+
+    xTaskCreate(Door_Task, "Door", 2048, NULL, 5, NULL);
+
+    xTaskCreate(Check_Task, "Check", 2048, NULL, 3, NULL);
+
+    xTaskCreate(Alarm_Task, "Alarm", 2048, NULL, 4, NULL);
+
+    xTaskCreate(Display_Task, "Display", 2048, NULL, 1, NULL);
+}
