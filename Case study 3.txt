@@ -1185,3 +1185,485 @@ void app_main(void)
 
     xTaskCreate(Display_Task, "Display", 2048, NULL, 1, NULL);
 }
+
+
+
+/*GreenHouse*/
+
+#include <string.h>
+#include <stdio.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+#include "esp_attr.h"
+
+#define SENSOR_INT  GPIO_NUM_14
+#define RELAY       GPIO_NUM_15
+#define STATUS_LED  GPIO_NUM_2
+
+#define TEMP_LIMIT  30
+
+#define PUMP_ON     1
+
+/* Sensor and OLED and RTC functions */
+
+void Sensor_Init(void);
+void Sensor_Read(float *temperature, float *humidity);
+
+void OLED_Init(void);
+void OLED_ShowEnvironment(float temperature, float humidity, int alert);
+void OLED_ShowClock(int hour, int minute, int second);
+
+void RTC_Init(void);
+void RTC_Read(int *hour, int *minute, int *second);
+
+/* RTOS Objects */
+
+QueueHandle_t xMeasurementQueue;
+QueueHandle_t xPumpQueue;
+
+SemaphoreHandle_t xSensorSem;
+SemaphoreHandle_t xOledMutex;
+SemaphoreHandle_t xPumpDoneSem;
+
+/* Pump State */
+
+int pumpRequested = 0;
+
+/* P1 - Sensor Task */
+
+void SensorTask(void *pvParameters)
+{
+    float data[2];
+
+    while (1)
+    {
+        xSemaphoreTake(xSensorSem, portMAX_DELAY);
+
+        Sensor_Read(&data[0], &data[1]);
+
+        xQueueSend(xMeasurementQueue, data, portMAX_DELAY);
+    }
+}
+
+/* P2 - Monitoring Task */
+
+void MonitoringTask(void *pvParameters)
+{
+    float data[2];
+    int alert;
+    int command;
+
+    while (1)
+    {
+        if (xSemaphoreTake(xPumpDoneSem, 0) == pdTRUE)
+        {
+            pumpRequested = 0;
+        }
+
+        if (xQueueReceive(xMeasurementQueue, data, pdMS_TO_TICKS(50)) == pdPASS)
+        {
+            alert = 0;
+
+            if (data[0] > TEMP_LIMIT)
+            {
+                alert = 1;
+
+                if (pumpRequested == 0)
+                {
+                    command = PUMP_ON;
+
+                    if (xQueueSend(xPumpQueue, &command, 0) == pdPASS)
+                    {
+                        pumpRequested = 1;
+                    }
+                }
+            }
+
+            xSemaphoreTake(xOledMutex, portMAX_DELAY);
+
+            OLED_ShowEnvironment(data[0], data[1], alert);
+
+            xSemaphoreGive(xOledMutex);
+        }
+    }
+}
+
+/* P3 - Pump Control Task */
+
+void PumpTask(void *pvParameters)
+{
+    int command;
+
+    while (1)
+    {
+        if (xQueueReceive(xPumpQueue, &command, portMAX_DELAY) == pdPASS)
+        {
+            if (command == PUMP_ON)
+            {
+                gpio_set_level(RELAY, 1);
+                gpio_set_level(STATUS_LED, 1);
+
+                vTaskDelay(pdMS_TO_TICKS(10000));
+
+                gpio_set_level(RELAY, 0);
+                gpio_set_level(STATUS_LED, 0);
+
+                xSemaphoreGive(xPumpDoneSem);
+            }
+        }
+    }
+}
+
+/* P4 - Clock Task */
+
+void ClockTask(void *pvParameters)
+{
+    int hour, minute, second;
+
+    TickType_t wait = xTaskGetTickCount();
+
+    while (1)
+    {
+        xSemaphoreTake(xOledMutex, portMAX_DELAY);
+
+        RTC_Read(&hour, &minute, &second);
+
+        OLED_ShowClock(hour, minute, second);
+
+        xSemaphoreGive(xOledMutex);
+
+        vTaskDelayUntil(&wait, pdMS_TO_TICKS(1000));
+    }
+}
+
+/* Sensor Interrupt */
+
+void IRAM_ATTR SENSOR_ISR(void *arg)
+{
+    BaseType_t waken = pdFALSE;
+
+    xSemaphoreGiveFromISR(xSensorSem, &waken);
+
+    if (waken == pdTRUE)
+    {
+      portYIELD_FROM_ISR();
+    }
+}
+
+/* MAIN */
+
+void app_main(void)
+{
+    Sensor_Init();
+    OLED_Init();
+    RTC_Init();
+
+    /* Create Queues */
+
+    xMeasurementQueue = xQueueCreate(4, sizeof(float) * 2);
+    xPumpQueue = xQueueCreate(4, sizeof(int));
+
+    /* Create Semaphore and Mutex */
+
+    xSensorSem = xSemaphoreCreateBinary();
+    xOledMutex = xSemaphoreCreateMutex();
+    xPumpDoneSem = xSemaphoreCreateBinary();
+
+    if (xMeasurementQueue == NULL || xPumpQueue == NULL ||
+        xSensorSem == NULL || xOledMutex == NULL ||
+        xPumpDoneSem == NULL)
+    {
+        return;
+    }
+
+    /* Configure output pins */
+
+    gpio_set_direction(RELAY, GPIO_MODE_OUTPUT);
+    gpio_set_direction(STATUS_LED, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(RELAY, 0);
+    gpio_set_level(STATUS_LED, 0);
+
+    /* Configure sensor interrupt pin */
+
+    gpio_set_direction(SENSOR_INT, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(SENSOR_INT, GPIO_PULLUP_ONLY);
+    gpio_set_intr_type(SENSOR_INT, GPIO_INTR_NEGEDGE);
+
+    if (gpio_install_isr_service(0) != ESP_OK)
+        return;
+
+    if (gpio_isr_handler_add(SENSOR_INT, SENSOR_ISR, NULL) != ESP_OK)
+        return;
+
+    /* Create Tasks */
+
+    xTaskCreate(SensorTask, "SensorTask", 4096, NULL, 3, NULL);
+
+    xTaskCreate(MonitoringTask, "MonitoringTask", 4096, NULL, 4, NULL);
+
+    xTaskCreate(PumpTask, "PumpTask", 4096, NULL, 2, NULL);
+
+    xTaskCreate(ClockTask, "ClockTask", 4096, NULL, 1, NULL);
+}
+
+
+
+
+
+#include <stdio.h>
+#include <stdbool.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+
+#include "DHT.h"
+#include "OLED.h"
+#include "RTC.h"
+
+// ================= CONFIGURATION =================
+
+#define TEMP_THRESHOLD      30.0
+
+#define PUMP_PIN            GPIO_NUM_26
+#define LED_PIN             GPIO_NUM_2
+
+#define PUMP_TIME            10000
+#define CLOCK_PERIOD         1000
+#define SENSOR_EVENT_PERIOD  2000
+
+#define SENSOR_PRIORITY      3
+#define MONITOR_PRIORITY     4
+#define PUMP_PRIORITY        2
+#define CLOCK_PRIORITY       1
+
+// ================= DATA =================
+
+typedef struct
+{
+    float temperature;
+    float humidity;
+
+} Measurement;
+
+typedef enum
+{
+    PUMP_OFF,
+    PUMP_ON
+
+} PumpCommand;
+
+// ================= RTOS OBJECTS =================
+
+SemaphoreHandle_t SensorSemaphore;
+
+QueueHandle_t MeasurementQueue;
+QueueHandle_t PumpQueue;
+
+SemaphoreHandle_t OLED_Mutex;
+
+// ================= SENSOR EVENT TASK =================
+// Simulation only: generates a new sensor event every 2 seconds.
+
+void SensorEventTask(void *pvParameters)
+{
+    TickType_t lastWakeTime = xTaskGetTickCount();
+
+    while (1)
+    {
+        xSemaphoreGive(SensorSemaphore);
+        vTaskDelayUntil(&lastWakeTime,pdMS_TO_TICKS(SENSOR_EVENT_PERIOD)
+        );
+    }
+}
+
+// ================= SENSOR TASK =================
+
+void SensorTask(void *pvParameters)
+{
+    Measurement data;
+
+    while (1)
+    {
+        xSemaphoreTake(SensorSemaphore, portMAX_DELAY);
+
+        DHT_Read(&data.temperature, &data.humidity);
+
+        xQueueSend(MeasurementQueue,&data,portMAX_DELAY);
+    }
+}
+
+// ================= MONITORING TASK =================
+
+void MonitoringTask(void *pvParameters)
+{
+    Measurement data;
+    PumpCommand command;
+
+    while (1)
+    {
+        xQueueReceive(MeasurementQueue,&data,portMAX_DELAY);
+
+        if (data.temperature > TEMP_THRESHOLD)
+        {
+            command = PUMP_ON;
+        }
+        else
+        {
+            command = PUMP_OFF;
+        }
+
+        xSemaphoreTake(OLED_Mutex, portMAX_DELAY);
+
+        OLED_ShowEnvironment(data.temperature,data.humidity,command == PUMP_ON);
+
+        xSemaphoreGive(OLED_Mutex);
+
+        xQueueOverwrite(PumpQueue, &command);
+    }
+}
+
+// ================= PUMP CONTROL TASK =================
+
+void PumpControlTask(void *pvParameters)
+{
+    PumpCommand command;
+
+    TickType_t startTime;
+    TickType_t currentTime;
+    TickType_t elapsedTime;
+    TickType_t remainingTime;
+
+    bool pumpIsOn = false;
+
+    while (1)
+    {
+        if (!pumpIsOn)
+        {
+            xQueueReceive(PumpQueue,&command,portMAX_DELAY);
+            if (command == PUMP_ON)
+            {
+                gpio_set_level(PUMP_PIN, 1);
+                pumpIsOn = true;
+                startTime = xTaskGetTickCount();
+            }
+        }
+        else
+        {
+            currentTime = xTaskGetTickCount();
+            elapsedTime = currentTime - startTime;
+
+            if (elapsedTime >= pdMS_TO_TICKS(PUMP_TIME))
+            {
+                gpio_set_level(PUMP_PIN, 0);
+
+                pumpIsOn = false;
+            }
+            else
+            {
+                remainingTime =pdMS_TO_TICKS(PUMP_TIME) - elapsedTime;
+
+                if (xQueueReceive(PumpQueue,&command,remainingTim) == pdTRUE)
+                {
+                    if (command == PUMP_OFF)
+                    {
+                        gpio_set_level(PUMP_PIN, 0);
+
+                        pumpIsOn = false;
+                    }
+                }
+                else
+                {
+                    gpio_set_level(PUMP_PIN, 0);
+
+                    pumpIsOn = false;
+                }
+            }
+        }
+    }
+}
+
+// ================= CLOCK TASK =================
+
+void ClockTask(void *pvParameters)
+{
+    char timeText[16];
+
+    TickType_t lastWakeTime = xTaskGetTickCount();
+
+    while (1)
+    {
+        xSemaphoreTake(OLED_Mutex, portMAX_DELAY);
+
+        RTC_ReadTime(timeText);
+
+        OLED_ShowTime(timeText);
+
+        xSemaphoreGive(OLED_Mutex);
+
+        vTaskDelayUntil(&lastWakeTime,pdMS_TO_TICKS(CLOCK_PERIOD) );
+    }
+}
+
+// ================= APP MAIN =================
+
+void app_main(void)
+{
+    // Initialize Drivers
+
+    DHT_Init();
+    OLED_Init();
+    RTC_Init();
+
+    // Initialize Pump
+
+    gpio_reset_pin(PUMP_PIN);
+    gpio_set_direction(PUMP_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(PUMP_PIN, 0);
+
+    // Initialize Status LED
+
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0);
+
+    // Create RTOS Objects
+
+    SensorSemaphore = xSemaphoreCreateBinary();
+
+    MeasurementQueue = xQueueCreate(5,sizeof(Measurement));
+
+    PumpQueue = xQueueCreate(1,sizeof(PumpCommand));
+
+    OLED_Mutex = xSemaphoreCreateMutex();
+
+    // Check RTOS Objects
+
+    if (SensorSemaphore == NULL || MeasurementQueue == NULL || PumpQueue == NULL || OLED_Mutex == NULL)
+    {
+        return;
+    }
+
+    // Create Tasks
+
+    xTaskCreate(SensorTask,"SensorTask",4096,NULL,SENSOR_PRIORITY,NULL);
+
+    xTaskCreate(MonitoringTask,"MonitoringTask",4096,NULL,MONITOR_PRIORITY,NULL);
+
+    xTaskCreate(PumpControlTask,"PumpControlTask",4096,NULL,PUMP_PRIORITY,NULL);
+
+    xTaskCreate(ClockTask,"ClockTask",4096,NULL,CLOCK_PRIORITY,NULL);
+
+    // Simulation Event Task
+
+    xTaskCreate(SensorEventTask,"SensorEventTask",2048,NULL,2,NULL);
+}
